@@ -1,0 +1,93 @@
+name: security-regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install minimal deps
+        run: pip install pydantic pydantic-settings pyyaml tiktoken "sqlalchemy[asyncio]" pgvector numpy
+      - name: Offline core tests (naive-vs-hardened security logic)
+        run: python backend/tests/test_offline_core.py
+      - name: Generate case study (offline harness)
+        run: python tools/offline_case_study.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: case-study
+          path: docs/CASE_STUDY.md
+
+  live-suites:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ragguard
+          POSTGRES_PASSWORD: ragguard
+          POSTGRES_DB: ragguard
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ragguard" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://ragguard:ragguard@localhost:5432/ragguard
+      REDIS_URL: redis://localhost:6379/0
+      # No provider keys -> deterministic offline mode, so CI is hermetic.
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend deps
+        run: pip install -r backend/requirements.txt
+      - name: Start target
+        working-directory: backend
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -sf localhost:8000/health && break || sleep 2
+          done
+
+      - name: Retrieval-quality eval (recall@k / MRR)
+        run: curl -s -X POST localhost:8000/api/eval/run | tee reports/retrieval_eval.json
+
+      - name: VectorGuard suites + local RAG scan (both modes) + case study
+        run: python tools/run_all.py
+
+      - name: Security gate — fail build if hardened mode has findings
+        run: |
+          set -e
+          ADMIN_TOKEN=$(curl -s localhost:8000/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"admin@ragguard.local","password":"ragguard-admin"}' | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+          curl -s -X POST localhost:8000/api/admin/security-mode \
+            -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+            -d '{"mode":"hardened"}' >/dev/null
+          for suite in rag_injection prompt_injection sensitive_data_disclosure unbounded_consumption; do
+            python tools/run_suites.py --target vectorguard_target.yaml \
+              --suite suites/$suite.yaml \
+              --report reports/gate/$suite.json --fail-on-findings
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vectorguard-reports
+          path: reports/

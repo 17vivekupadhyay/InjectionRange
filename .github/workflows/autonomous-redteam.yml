@@ -1,0 +1,70 @@
+name: autonomous-redteam
+
+# Periodic (not per-commit) adversarial check: VectorGuard's autonomous red-team
+# agent drives adaptive multi-turn attacks against HARDENED mode. Archives captured
+# exploit transcripts if any objective succeeds. Runs weekly + on demand.
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  redteam:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ragguard
+          POSTGRES_PASSWORD: ragguard
+          POSTGRES_DB: ragguard
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ragguard" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://ragguard:ragguard@localhost:5432/ragguard
+      REDIS_URL: redis://localhost:6379/0
+      # Supply a real ANTHROPIC_API_KEY secret for a meaningful adaptive attack;
+      # without it the target runs in deterministic offline mode.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend deps
+        run: pip install -r backend/requirements.txt
+      - name: Start target (hardened)
+        working-directory: backend
+        env:
+          RAG_SECURITY_MODE: hardened
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          for i in $(seq 1 30); do curl -sf localhost:8000/health && break || sleep 2; done
+
+      - name: Autonomous red-team agent
+        run: |
+          # Requires the external VectorGuard package. If unavailable, this step is
+          # a no-op guard rather than a hard failure.
+          if python -c "import vectorguard" 2>/dev/null; then
+            python -m vectorguard.agent run \
+              --config suites/autonomous_agent.yaml \
+              --report reports/agent/summary.json || true
+          else
+            echo "VectorGuard package not installed; skipping autonomous agent run."
+            mkdir -p reports/agent
+            echo '{"skipped": "vectorguard not installed"}' > reports/agent/summary.json
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-transcripts
+          path: reports/agent/
